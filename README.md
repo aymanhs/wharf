@@ -1,10 +1,10 @@
-# dock
+# wharf
 
 A minimal, keyboard-first Docker TUI for people who move fast.
 
-If your daily flow is Docker PS, Docker exec, restart, delete, logs, and image cleanup, dock keeps all of it in one lightweight terminal UI.
+If your daily flow is Docker PS, Docker exec, restart, delete, logs, and image cleanup, wharf keeps all of it in one lightweight terminal UI.
 
-## Why dock
+## Why wharf
 
 - Single binary
 - SSH-friendly
@@ -61,18 +61,18 @@ Pick target, press key, done.
 ### Build locally
 
 ```bash
-go build -o dock .
+go build -o wharf .
 ```
 
 ### Run
 
 ```bash
-./dock
+./wharf
 ```
 
 ## Philosophy
 
-Dock is not trying to be Docker Desktop in your terminal.
+Wharf is not trying to be Docker Desktop in your terminal.
 
 It is intentionally opinionated:
 

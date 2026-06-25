@@ -601,7 +601,7 @@ func (m model) View() string {
 		Background(lipgloss.Color("24")).
 		Padding(0, 1).
 		Bold(true).
-		Render(fmt.Sprintf("dock [%s]", modeLabel))
+		Render(fmt.Sprintf("wharf [%s]", modeLabel))
 
 	modeShort := "running"
 	if m.mode == viewContainers && m.showAll {
@@ -655,7 +655,7 @@ func runAttached(cmd *exec.Cmd) error {
 	cmd.Stderr = os.Stderr
 
 	// While attached to child process, capture SIGINT in parent so Ctrl-C can
-	// stop the child without terminating dock itself.
+	// stop the child without terminating wharf itself.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer func() {
