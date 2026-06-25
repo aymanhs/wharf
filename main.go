@@ -61,7 +61,7 @@ type model struct {
 	status         string
 	err            error
 	confirming     confirmAction
-	selectedImages map[string]bool
+	selectedImages map[string]struct{}
 
 	// Set when user requests interactive shell handoff so main can resume after quitting.
 	shellAction string
@@ -85,12 +85,15 @@ func newModel(cli *client.Client, showAll bool, cursor int) model {
 	)
 	t.KeyMap.LineUp.SetKeys("k", "up")
 	t.KeyMap.LineDown.SetKeys("j", "down")
-	t.KeyMap.PageUp.SetKeys("b")
-	t.KeyMap.PageDown.SetKeys("f")
-	t.KeyMap.HalfPageUp.SetEnabled(false)
-	t.KeyMap.HalfPageDown.SetEnabled(false)
-	t.KeyMap.GotoTop.SetEnabled(false)
-	t.KeyMap.GotoBottom.SetEnabled(false)
+	// PageDown default includes space, which is the image-select toggle here.
+	t.KeyMap.PageUp.SetKeys("b", "pgup")
+	t.KeyMap.PageDown.SetKeys("f", "pgdown")
+	// HalfPageDown default includes "d", which is delete here.
+	t.KeyMap.HalfPageUp.SetKeys("ctrl+u")
+	t.KeyMap.HalfPageDown.SetKeys("ctrl+d")
+	// GotoTop default includes "g", which is refresh here; bind to home/end only.
+	t.KeyMap.GotoTop.SetKeys("home")
+	t.KeyMap.GotoBottom.SetKeys("end", "G")
 
 	styles := table.DefaultStyles()
 	styles.Header = styles.Header.
@@ -105,7 +108,7 @@ func newModel(cli *client.Client, showAll bool, cursor int) model {
 		Bold(true)
 	t.SetStyles(styles)
 
-	m := model{cli: cli, showAll: showAll, cursor: cursor, table: t, mode: viewContainers, selectedImages: make(map[string]bool)}
+	m := model{cli: cli, showAll: showAll, cursor: cursor, table: t, mode: viewContainers, selectedImages: make(map[string]struct{})}
 	m.table.SetCursor(cursor)
 	return m
 }
@@ -118,7 +121,9 @@ func (m model) refreshCmd() tea.Cmd {
 	showAll := m.showAll
 	mode := m.mode
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// `ImageList(All: true)` walks every layer; 5s was too tight on hosts
+		// with hundreds of images. Same budget for ContainerList for symmetry.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
 		switch mode {
@@ -206,9 +211,13 @@ func (m *model) syncRows() {
 	if m.mode == viewImages {
 		rows = make([]table.Row, 0, len(m.images))
 		for _, img := range m.images {
+			// Cell values must be PLAIN TEXT — bubbles/table truncates each
+			// cell with runewidth, which counts every byte of an ANSI escape
+			// sequence as a column, shifting the row left when styled. Use a
+			// distinct ASCII marker for selection instead of color.
 			mark := " "
-			if m.selectedImages[img.ID] {
-				mark = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render("*")
+			if _, ok := m.selectedImages[img.ID]; ok {
+				mark = "*"
 			}
 			rows = append(rows, table.Row{
 				mark,
@@ -254,32 +263,39 @@ func (m *model) resizeTable() {
 		m.height = 24
 	}
 
-	headerLines := 3
-	footerLines := 3
-	extraLines := 0
+	// Total vertical chrome (header + summary + blank + blank + help) plus a
+	// row for the status line and another for the error line when present.
+	const baseChrome = 6
+	extra := 0
 	if m.status != "" {
-		extraLines++
+		extra++
 	}
 	if m.err != nil {
-		extraLines++
+		extra++
 	}
+	tableHeight := max(3, m.height-baseChrome-extra)
 
-	tableHeight := m.height - headerLines - footerLines - extraLines
-	if tableHeight < 3 {
-		tableHeight = 3
-	}
+	// `tableHorizPadding` is the sum of per-cell padding and borders consumed
+	// by the bubbles/table layout — extracted so the column-width math reads
+	// as "total width minus fixed columns minus chrome".
+	const (
+		tableHorizPadding = 14
+		idWidth           = 12
+		minName           = 14
+	)
 
-	idWidth := 12
+	tableWidth := max(20, m.width-2)
+	m.table.SetHeight(tableHeight)
+	m.table.SetWidth(tableWidth)
+
 	if m.mode == viewImages {
-		markWidth := 3
-		sizeWidth := 11
-		createdWidth := 11
-		nameWidth := m.width - markWidth - idWidth - sizeWidth - createdWidth - 16
-		if nameWidth < 20 {
-			nameWidth = 20
-		}
-		m.table.SetHeight(tableHeight)
-		m.table.SetWidth(max(20, m.width-2))
+		const (
+			markWidth    = 3
+			sizeWidth    = 11
+			createdWidth = 11
+			minImageName = 20
+		)
+		nameWidth := max(minImageName, m.width-markWidth-idWidth-sizeWidth-createdWidth-tableHorizPadding-2)
 		m.table.SetColumns([]table.Column{
 			{Title: "Sel", Width: markWidth},
 			{Title: "ID", Width: idWidth},
@@ -290,36 +306,15 @@ func (m *model) resizeTable() {
 		return
 	}
 
-	statusWidth := m.width / 4
-	if statusWidth < 18 {
-		statusWidth = 18
-	}
-	if statusWidth > 30 {
-		statusWidth = 30
-	}
-	stateWidth := 10
-	imageWidth := m.width / 5
-	if imageWidth < 16 {
-		imageWidth = 16
-	}
-	if imageWidth > 34 {
-		imageWidth = 34
-	}
-	nameWidth := m.width - idWidth - imageWidth - stateWidth - statusWidth - 14
-	if nameWidth < 14 {
-		nameWidth = 14
-	}
-	imageWidth = m.width - idWidth - nameWidth - stateWidth - statusWidth - 14
-	if imageWidth < 14 {
-		imageWidth = 14
-	}
-	statusWidth = m.width - idWidth - nameWidth - imageWidth - stateWidth - 14
-	if statusWidth < 14 {
-		statusWidth = 14
-	}
+	const stateWidth = 10
+	statusWidth := clampInt(m.width/4, 18, 30)
+	imageWidth := clampInt(m.width/5, 16, 34)
+	nameWidth := max(minName, m.width-idWidth-imageWidth-stateWidth-statusWidth-tableHorizPadding)
+	// Absorb leftover width into image and status columns (in that order) so
+	// the table fills the screen rather than leaving a gap.
+	imageWidth = max(minName, m.width-idWidth-nameWidth-stateWidth-statusWidth-tableHorizPadding)
+	statusWidth = max(minName, m.width-idWidth-nameWidth-imageWidth-stateWidth-tableHorizPadding)
 
-	m.table.SetHeight(tableHeight)
-	m.table.SetWidth(max(20, m.width-2))
 	m.table.SetColumns([]table.Column{
 		{Title: "ID", Width: idWidth},
 		{Title: "Container", Width: nameWidth},
@@ -329,17 +324,38 @@ func (m *model) resizeTable() {
 	})
 }
 
-func (m model) selected() *container.Summary {
-	if len(m.containers) == 0 {
-		return nil
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// clampCursor pins m.cursor into [0, n) and returns it. Centralized so callers
+// can rely on m.cursor staying valid after this call; using a pointer receiver
+// is the difference between an in-place clamp and a silent no-op on a copy.
+func (m *model) clampCursor(n int) int {
+	if n <= 0 {
+		m.cursor = 0
+		return 0
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
-	if m.cursor >= len(m.containers) {
-		m.cursor = len(m.containers) - 1
+	if m.cursor >= n {
+		m.cursor = n - 1
 	}
-	return &m.containers[m.cursor]
+	return m.cursor
+}
+
+func (m *model) selected() *container.Summary {
+	if len(m.containers) == 0 {
+		return nil
+	}
+	return &m.containers[m.clampCursor(len(m.containers))]
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -353,17 +369,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode != viewContainers {
 			return m, nil
 		}
-		if m.cursor >= len(m.containers) {
-			m.cursor = max(0, len(m.containers)-1)
-		}
-		if len(m.containers) == 0 {
-			m.cursor = 0
-		}
+		m.clampCursor(len(m.containers))
 		m.syncRows()
 		m.resizeTable()
 		m.err = nil
 		return m, nil
 	case imagesMsg:
+		// Remember which image the cursor was on so we can restore it after
+		// the sort below — `m.cursor` is positional, so a re-sort silently
+		// moves the user's selection to a different image otherwise.
+		var prevID string
+		if m.mode == viewImages && m.cursor >= 0 && m.cursor < len(m.images) {
+			prevID = m.images[m.cursor].ID
+		}
+
 		m.images = msg.items
 		present := make(map[string]bool, len(m.images))
 		for _, img := range m.images {
@@ -383,12 +402,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode != viewImages {
 			return m, nil
 		}
-		if m.cursor >= len(m.images) {
-			m.cursor = max(0, len(m.images)-1)
+		if prevID != "" {
+			for i := range m.images {
+				if m.images[i].ID == prevID {
+					m.cursor = i
+					break
+				}
+			}
 		}
-		if len(m.images) == 0 {
-			m.cursor = 0
-		}
+		m.clampCursor(len(m.images))
 		m.syncRows()
 		m.resizeTable()
 		m.err = nil
@@ -528,10 +550,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if img == nil {
 				return m, nil
 			}
-			if m.selectedImages[img.ID] {
+			if _, ok := m.selectedImages[img.ID]; ok {
 				delete(m.selectedImages, img.ID)
 			} else {
-				m.selectedImages[img.ID] = true
+				m.selectedImages[img.ID] = struct{}{}
 			}
 			m.syncRows()
 			return m, nil
@@ -571,6 +593,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.shellID = sel.ID
 			return m, tea.Quit
 		case "l":
+			if m.mode != viewContainers {
+				return m, nil
+			}
 			sel := m.selected()
 			if sel == nil {
 				return m, nil
@@ -610,9 +635,11 @@ func (m model) View() string {
 	if m.mode == viewImages {
 		modeShort = "images"
 	}
+	// `len(m.selectedImages)` is the selection count directly — selectedImageIDs
+	// would allocate and sort on every render for no reason.
 	summary := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("109")).
-		Render(fmt.Sprintf("containers: %d   images: %d   selected: %d   mode: %s", len(m.containers), len(m.images), len(m.selectedImageIDs()), modeShort))
+		Render(fmt.Sprintf("containers: %d   images: %d   selected: %d   mode: %s", len(m.containers), len(m.images), len(m.selectedImages), modeShort))
 
 	help := renderHelp(m.mode)
 
@@ -727,15 +754,17 @@ func renderHelp(mode viewMode) string {
 		msg string
 	}
 
-	parts := []helpPart{{"j/k", "move"}, {"i/tab", "view"}, {"g", "refresh"}, {"q", "quit"}}
-	if mode == viewContainers {
+	parts := []helpPart{{"j/k", "move"}, {"pg/home/end", "jump"}, {"i/tab", "view"}, {"g", "refresh"}, {"q", "quit"}}
+	switch mode {
+	case viewContainers:
 		parts = []helpPart{
-			{"j/k", "move"}, {"i/tab", "view"}, {"a", "toggle"}, {"g", "refresh"},
+			{"j/k", "move"}, {"pg/home/end", "jump"}, {"i/tab", "view"}, {"a", "toggle"}, {"g", "refresh"},
 			{"r", "restart"}, {"d", "delete"}, {"x", "exec"}, {"l", "logs"}, {"q", "quit"},
 		}
-	} else if mode == viewImages {
+	case viewImages:
 		parts = []helpPart{
-			{"j/k", "move"}, {"i/tab", "view"}, {"g", "refresh"}, {"space", "select"}, {"D", "del sel"}, {"d", "delete"}, {"p", "prune"}, {"q", "quit"},
+			{"j/k", "move"}, {"pg/home/end", "jump"}, {"i/tab", "view"}, {"g", "refresh"}, {"space", "select"},
+			{"D", "del sel"}, {"d", "delete"}, {"p", "prune"}, {"q", "quit"},
 		}
 	}
 
@@ -785,33 +814,27 @@ func shortAge(t time.Time) string {
 	return strconv.FormatInt(int64(d/(365*24*time.Hour)), 10) + "y"
 }
 
-func (m model) selectedImage() *image.Summary {
+func (m *model) selectedImage() *image.Summary {
 	if len(m.images) == 0 {
 		return nil
 	}
-	idx := m.cursor
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(m.images) {
-		idx = len(m.images) - 1
-	}
-	return &m.images[idx]
+	return &m.images[m.clampCursor(len(m.images))]
 }
 
 func (m model) selectedImageIDs() []string {
 	ids := make([]string, 0, len(m.selectedImages))
-	for id, on := range m.selectedImages {
-		if on {
-			ids = append(ids, id)
-		}
+	for id := range m.selectedImages {
+		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	return ids
 }
 
 func removeImageWithRetry(cli *client.Client, id string) error {
-	timeouts := []time.Duration{2 * time.Minute, 5 * time.Minute}
+	// Shorter budgets — a bulk delete of N images was effectively unkillable
+	// at 2m+5m per image. If the daemon really needs longer than this, the
+	// user can retry from the UI.
+	timeouts := []time.Duration{30 * time.Second, 90 * time.Second}
 	var lastErr error
 	for _, timeout := range timeouts {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -825,9 +848,8 @@ func removeImageWithRetry(cli *client.Client, id string) error {
 			return err
 		}
 	}
-	if lastErr == nil {
-		lastErr = context.DeadlineExceeded
-	}
+	// lastErr is always non-nil here: the loop only exits without returning
+	// when both iterations errored, and every iteration assigns lastErr.
 	return fmt.Errorf("image delete timed out after retry: %w", lastErr)
 }
 
