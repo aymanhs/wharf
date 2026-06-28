@@ -18,13 +18,19 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
 )
 
 type errMsg struct{ err error }
 type containersMsg struct{ items []container.Summary }
-type imagesMsg struct{ items []image.Summary }
+type volumesMsg struct{ items []*volume.Volume }
+type imagesMsg struct {
+	items      []image.Summary
+	imageUsage map[string]int
+	childCount map[string]int
+}
 type actionDoneMsg struct {
 	err     error
 	status  string
@@ -36,9 +42,12 @@ type viewMode string
 const (
 	viewContainers viewMode = "containers"
 	viewImages     viewMode = "images"
+	viewVolumes    viewMode = "volumes"
 )
 
 type confirmAction string
+
+type imageSortMode string
 
 const (
 	confirmNone            confirmAction = ""
@@ -46,11 +55,20 @@ const (
 	confirmDeleteImage     confirmAction = "delete-image"
 	confirmDeleteSelected  confirmAction = "delete-selected-images"
 	confirmPruneImages     confirmAction = "prune-images"
+	confirmDeleteVolume    confirmAction = "delete-volume"
+	confirmPruneVolumes    confirmAction = "prune-volumes"
+)
+
+const (
+	imageSortSize imageSortMode = "size"
+	imageSortAge  imageSortMode = "age"
+	imageSortName imageSortMode = "name"
 )
 
 type model struct {
 	cli            *client.Client
 	containers     []container.Summary
+	volumes        []*volume.Volume
 	images         []image.Summary
 	cursor         int
 	showAll        bool
@@ -62,6 +80,11 @@ type model struct {
 	err            error
 	confirming     confirmAction
 	selectedImages map[string]struct{}
+	imageUsage     map[string]int
+	imageChildren  map[string]int
+	imagesAll      []image.Summary
+	danglingOnly   bool
+	imageSort      imageSortMode
 
 	// Set when user requests interactive shell handoff so main can resume after quitting.
 	shellAction string
@@ -69,16 +92,17 @@ type model struct {
 }
 
 func newModel(cli *client.Client, showAll bool, cursor int) model {
-	cols := []table.Column{
-		{Title: "ID", Width: 12},
-		{Title: "Container", Width: 20},
-		{Title: "Image", Width: 24},
-		{Title: "State", Width: 10},
-		{Title: "Status", Width: 20},
-	}
-
 	t := table.New(
-		table.WithColumns(cols),
+		table.WithColumns([]table.Column{
+			{Title: "ID", Width: 12},
+			{Title: "Container", Width: 16},
+			{Title: "Image", Width: 16},
+			{Title: "Ports", Width: 34},
+			{Title: "Age", Width: 7},
+			{Title: "Exit", Width: 3},
+			{Title: "State", Width: 5},
+			{Title: "Status", Width: 16},
+		}),
 		table.WithRows([]table.Row{}),
 		table.WithFocused(true),
 		table.WithHeight(12),
@@ -104,11 +128,21 @@ func newModel(cli *client.Client, showAll bool, cursor int) model {
 		Bold(true)
 	styles.Selected = styles.Selected.
 		Foreground(lipgloss.Color("230")).
-		Background(lipgloss.Color("33")).
+		Background(lipgloss.Color("24")).
 		Bold(true)
 	t.SetStyles(styles)
 
-	m := model{cli: cli, showAll: showAll, cursor: cursor, table: t, mode: viewContainers, selectedImages: make(map[string]struct{})}
+	m := model{
+		cli:            cli,
+		showAll:        showAll,
+		cursor:         cursor,
+		table:          t,
+		mode:           viewContainers,
+		selectedImages: make(map[string]struct{}),
+		imageUsage:     make(map[string]int),
+		imageChildren:  make(map[string]int),
+		imageSort:      imageSortSize,
+	}
 	m.table.SetCursor(cursor)
 	return m
 }
@@ -132,7 +166,17 @@ func (m model) refreshCmd() tea.Cmd {
 			if err != nil {
 				return errMsg{err: err}
 			}
-			return imagesMsg{items: items}
+			containers, err := m.cli.ContainerList(ctx, container.ListOptions{All: true})
+			if err != nil {
+				return errMsg{err: err}
+			}
+			return imagesMsg{items: items, imageUsage: buildImageUsageMap(containers), childCount: buildImageChildCountMap(items)}
+		case viewVolumes:
+			resp, err := m.cli.VolumeList(ctx, volume.ListOptions{})
+			if err != nil {
+				return errMsg{err: err}
+			}
+			return volumesMsg{items: resp.Volumes}
 		default:
 			items, err := m.cli.ContainerList(ctx, container.ListOptions{All: showAll})
 			if err != nil {
@@ -140,6 +184,30 @@ func (m model) refreshCmd() tea.Cmd {
 			}
 			return containersMsg{items: items}
 		}
+	}
+}
+
+func (m model) deleteVolumeCmd(name string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		err := m.cli.VolumeRemove(ctx, name, true)
+		return actionDoneMsg{err: err, status: "volume deleted", refresh: true}
+	}
+}
+
+func (m model) pruneVolumesCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		report, err := m.cli.VolumesPrune(ctx, filters.NewArgs())
+		if err != nil {
+			return actionDoneMsg{err: err, status: "", refresh: false}
+		}
+		reclaimed := units.HumanSize(float64(report.SpaceReclaimed))
+		return actionDoneMsg{err: nil, status: "volumes pruned (reclaimed " + reclaimed + ")", refresh: true}
 	}
 }
 
@@ -219,12 +287,28 @@ func (m *model) syncRows() {
 			if _, ok := m.selectedImages[img.ID]; ok {
 				mark = "*"
 			}
+			useCount := imageUseCount(img, m.imageUsage)
 			rows = append(rows, table.Row{
 				mark,
 				shortID(img.ID),
 				imageName(img),
+				strconv.Itoa(useCount),
+				yesNo(useCount > 0),
+				yesNo(isDanglingImage(img, m.imageChildren)),
 				units.HumanSize(float64(img.Size)),
+				virtualSizeText(img),
 				shortAge(time.Unix(img.Created, 0)),
+			})
+		}
+	} else if m.mode == viewVolumes {
+		rows = make([]table.Row, 0, len(m.volumes))
+		for _, v := range m.volumes {
+			rows = append(rows, table.Row{
+				v.Name,
+				v.Driver,
+				v.Scope,
+				shortAge(parseVolumeCreatedAt(v.CreatedAt)),
+				shortPath(v.Mountpoint, 42),
 			})
 		}
 	} else {
@@ -234,8 +318,11 @@ func (m *model) syncRows() {
 				shortID(c.ID),
 				containerName(c),
 				shortImageRef(c.Image),
-				colorState(c.State),
-				colorStatus(c.Status),
+				containerPorts(c),
+				shortAge(time.Unix(c.Created, 0)),
+				containerExitCode(c),
+				c.State,
+				c.Status,
 			})
 		}
 	}
@@ -279,9 +366,9 @@ func (m *model) resizeTable() {
 	// by the bubbles/table layout — extracted so the column-width math reads
 	// as "total width minus fixed columns minus chrome".
 	const (
-		tableHorizPadding = 14
+		tableHorizPadding = 10
 		idWidth           = 12
-		minName           = 14
+		minName           = 12
 	)
 
 	tableWidth := max(20, m.width-2)
@@ -289,39 +376,70 @@ func (m *model) resizeTable() {
 	m.table.SetWidth(tableWidth)
 
 	if m.mode == viewImages {
-		const (
-			markWidth    = 3
-			sizeWidth    = 11
-			createdWidth = 11
-			minImageName = 20
-		)
-		nameWidth := max(minImageName, m.width-markWidth-idWidth-sizeWidth-createdWidth-tableHorizPadding-2)
-		m.table.SetColumns([]table.Column{
-			{Title: "Sel", Width: markWidth},
+		nameWidth := max(16, m.width-3-idWidth-4-5-8-10-10-6-tableHorizPadding)
+
+		imageTitle := "Image"
+		if m.imageSort == imageSortName {
+			imageTitle = ".Image ↑"
+		}
+		sizeTitle := "Size"
+		if m.imageSort == imageSortSize {
+			sizeTitle = ".Size ↓"
+		}
+		ageTitle := "Age"
+		if m.imageSort == imageSortAge {
+			ageTitle = ".Age ↓"
+		}
+
+		m.setColumns([]table.Column{
+			{Title: "Sel", Width: 3},
 			{Title: "ID", Width: idWidth},
-			{Title: "Image", Width: nameWidth},
-			{Title: "Size", Width: sizeWidth},
-			{Title: "Created", Width: createdWidth},
+			{Title: imageTitle, Width: nameWidth},
+			{Title: "Use", Width: 4},
+			{Title: "InUse", Width: 5},
+			{Title: "Dangling", Width: 8},
+			{Title: sizeTitle, Width: 10},
+			{Title: "VSize", Width: 10},
+			{Title: ageTitle, Width: 6},
+		})
+		return
+	}
+	if m.mode == viewVolumes {
+		remaining := m.width - 10 - 8 - 8 - tableHorizPadding
+		nameWidth := max(16, remaining/3)
+		mountWidth := max(18, remaining-nameWidth)
+		m.setColumns([]table.Column{
+			{Title: "Name", Width: nameWidth},
+			{Title: "Driver", Width: 10},
+			{Title: "Scope", Width: 8},
+			{Title: "Age", Width: 8},
+			{Title: "Mountpoint", Width: mountWidth},
 		})
 		return
 	}
 
-	const stateWidth = 10
-	statusWidth := clampInt(m.width/4, 18, 30)
-	imageWidth := clampInt(m.width/5, 16, 34)
-	nameWidth := max(minName, m.width-idWidth-imageWidth-stateWidth-statusWidth-tableHorizPadding)
-	// Absorb leftover width into image and status columns (in that order) so
-	// the table fills the screen rather than leaving a gap.
-	imageWidth = max(minName, m.width-idWidth-nameWidth-stateWidth-statusWidth-tableHorizPadding)
-	statusWidth = max(minName, m.width-idWidth-nameWidth-imageWidth-stateWidth-tableHorizPadding)
+	remaining := m.width - idWidth - 54 - 7 - 6 - 10 - 16 - tableHorizPadding
+	nameWidth := max(minName, remaining/3)
+	imageWidth := max(12, remaining-nameWidth)
 
-	m.table.SetColumns([]table.Column{
+	m.setColumns([]table.Column{
 		{Title: "ID", Width: idWidth},
 		{Title: "Container", Width: nameWidth},
 		{Title: "Image", Width: imageWidth},
-		{Title: "State", Width: stateWidth},
-		{Title: "Status", Width: statusWidth},
+		{Title: "Ports", Width: 54},
+		{Title: "Age", Width: 7},
+		{Title: "Exit", Width: 6},
+		{Title: "State", Width: 10},
+		{Title: "Status", Width: 16},
 	})
+}
+
+func (m *model) setColumns(cols []table.Column) {
+	rows := m.table.Rows()
+	if len(rows) > 0 && len(rows[0]) != len(cols) {
+		m.table.SetRows([]table.Row{})
+	}
+	m.table.SetColumns(cols)
 }
 
 func clampInt(v, lo, hi int) int {
@@ -358,6 +476,13 @@ func (m *model) selected() *container.Summary {
 	return &m.containers[m.clampCursor(len(m.containers))]
 }
 
+func (m *model) selectedVolume() *volume.Volume {
+	if len(m.volumes) == 0 {
+		return nil
+	}
+	return m.volumes[m.clampCursor(len(m.volumes))]
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case errMsg:
@@ -370,8 +495,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.clampCursor(len(m.containers))
-		m.syncRows()
 		m.resizeTable()
+		m.syncRows()
+		m.err = nil
+		return m, nil
+	case volumesMsg:
+		m.volumes = msg.items
+		if m.mode != viewVolumes {
+			return m, nil
+		}
+		m.clampCursor(len(m.volumes))
+		m.resizeTable()
+		m.syncRows()
 		m.err = nil
 		return m, nil
 	case imagesMsg:
@@ -383,7 +518,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prevID = m.images[m.cursor].ID
 		}
 
-		m.images = msg.items
+		m.imagesAll = msg.items
+		m.imageUsage = msg.imageUsage
+		m.imageChildren = msg.childCount
+		m.rebuildImages()
 		present := make(map[string]bool, len(m.images))
 		for _, img := range m.images {
 			present[img.ID] = true
@@ -393,12 +531,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.selectedImages, id)
 			}
 		}
-		sort.SliceStable(m.images, func(i, j int) bool {
-			if m.images[i].Size == m.images[j].Size {
-				return m.images[i].Created > m.images[j].Created
-			}
-			return m.images[i].Size > m.images[j].Size
-		})
 		if m.mode != viewImages {
 			return m, nil
 		}
@@ -411,8 +543,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.clampCursor(len(m.images))
-		m.syncRows()
 		m.resizeTable()
+		m.syncRows()
 		m.err = nil
 		return m, nil
 	case tea.WindowSizeMsg:
@@ -467,6 +599,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.deleteSelectedImagesCmd(ids)
 				case confirmPruneImages:
 					return m, m.pruneImagesCmd()
+				case confirmDeleteVolume:
+					vol := m.selectedVolume()
+					if vol == nil {
+						m.status = "no volume selected"
+						m.resizeTable()
+						return m, nil
+					}
+					return m, m.deleteVolumeCmd(vol.Name)
+				case confirmPruneVolumes:
+					return m, m.pruneVolumesCmd()
 				default:
 					m.status = ""
 					m.resizeTable()
@@ -490,13 +632,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "i", "tab":
 			if m.mode == viewContainers {
 				m.mode = viewImages
+			} else if m.mode == viewImages {
+				m.mode = viewVolumes
 			} else {
 				m.mode = viewContainers
 			}
 			m.status = ""
 			m.err = nil
-			m.syncRows()
 			m.resizeTable()
+			m.syncRows()
 			return m, m.refreshCmd()
 		case "g", "ctrl+r":
 			m.status = ""
@@ -529,6 +673,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.confirming = confirmDeleteImage
 				m.status = fmt.Sprintf("delete image %s? y/n", shortID(img.ID))
+				m.err = nil
+				m.resizeTable()
+				return m, nil
+			}
+			if m.mode == viewVolumes {
+				vol := m.selectedVolume()
+				if vol == nil {
+					return m, nil
+				}
+				m.confirming = confirmDeleteVolume
+				m.status = fmt.Sprintf("delete volume %s? y/n", vol.Name)
 				m.err = nil
 				m.resizeTable()
 				return m, nil
@@ -574,6 +729,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "p":
 			if m.mode != viewImages {
+				if m.mode == viewVolumes {
+					m.confirming = confirmPruneVolumes
+					m.status = "prune unused volumes? y/n"
+					m.err = nil
+					m.resizeTable()
+					return m, nil
+				}
 				return m, nil
 			}
 			m.confirming = confirmPruneImages
@@ -581,17 +743,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			m.resizeTable()
 			return m, nil
+		case "f":
+			if m.mode != viewImages {
+				return m, nil
+			}
+			m.danglingOnly = !m.danglingOnly
+			m.rebuildImages()
+			m.resizeTable()
+			m.syncRows()
+			if m.danglingOnly {
+				m.status = "filter: dangling only"
+			} else {
+				m.status = "filter: all images"
+			}
+			m.err = nil
+			return m, nil
+		case "s":
+			if m.mode != viewImages {
+				return m, nil
+			}
+			switch m.imageSort {
+			case imageSortSize:
+				m.imageSort = imageSortAge
+			case imageSortAge:
+				m.imageSort = imageSortName
+			default:
+				m.imageSort = imageSortSize
+			}
+			m.rebuildImages()
+			m.resizeTable()
+			m.syncRows()
+			m.status = "sort: " + string(m.imageSort)
+			m.err = nil
+			return m, nil
 		case "x":
-			if m.mode != viewContainers {
-				return m, nil
+			if m.mode == viewContainers {
+				sel := m.selected()
+				if sel == nil {
+					return m, nil
+				}
+				m.shellAction = "exec"
+				m.shellID = sel.ID
+				return m, tea.Quit
 			}
-			sel := m.selected()
-			if sel == nil {
-				return m, nil
+			if m.mode == viewImages {
+				img := m.selectedImage()
+				if img == nil {
+					return m, nil
+				}
+				m.shellAction = "run-image-bash"
+				m.shellID = imageRunRef(*img)
+				return m, tea.Quit
 			}
-			m.shellAction = "exec"
-			m.shellID = sel.ID
-			return m, tea.Quit
+			return m, nil
 		case "l":
 			if m.mode != viewContainers {
 				return m, nil
@@ -620,6 +824,9 @@ func (m model) View() string {
 	if m.mode == viewImages {
 		modeLabel = "images"
 	}
+	if m.mode == viewVolumes {
+		modeLabel = "volumes"
+	}
 
 	header := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("231")).
@@ -634,12 +841,18 @@ func (m model) View() string {
 	}
 	if m.mode == viewImages {
 		modeShort = "images"
+		if m.danglingOnly {
+			modeShort += ":dangling"
+		}
+		modeShort += ":sort=" + string(m.imageSort)
+	} else if m.mode == viewVolumes {
+		modeShort = "volumes"
 	}
 	// `len(m.selectedImages)` is the selection count directly — selectedImageIDs
 	// would allocate and sort on every render for no reason.
 	summary := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("109")).
-		Render(fmt.Sprintf("containers: %d   images: %d   selected: %d   mode: %s", len(m.containers), len(m.images), len(m.selectedImages), modeShort))
+		Render(fmt.Sprintf("containers: %d   images: %d   volumes: %d   selected: %d   mode: %s", len(m.containers), len(m.images), len(m.volumes), len(m.selectedImages), modeShort))
 
 	help := renderHelp(m.mode)
 
@@ -673,6 +886,11 @@ func containerName(c container.Summary) string {
 
 func runExecBash(id string) error {
 	cmd := exec.Command("docker", "exec", "-it", id, "bash")
+	return runAttached(cmd)
+}
+
+func runImageBash(ref string) error {
+	cmd := exec.Command("docker", "run", "--rm", "-it", ref, "bash")
 	return runAttached(cmd)
 }
 
@@ -764,7 +982,12 @@ func renderHelp(mode viewMode) string {
 	case viewImages:
 		parts = []helpPart{
 			{"j/k", "move"}, {"pg/home/end", "jump"}, {"i/tab", "view"}, {"g", "refresh"}, {"space", "select"},
-			{"D", "del sel"}, {"d", "delete"}, {"p", "prune"}, {"q", "quit"},
+			{"D", "del sel"}, {"d", "delete"}, {"p", "prune"}, {"f", "dangling"}, {"s", "sort"}, {"x", "run bash"}, {"q", "quit"},
+		}
+	case viewVolumes:
+		parts = []helpPart{
+			{"j/k", "move"}, {"pg/home/end", "jump"}, {"i/tab", "view"}, {"g", "refresh"},
+			{"d", "delete"}, {"p", "prune"}, {"q", "quit"},
 		}
 	}
 
@@ -773,7 +996,7 @@ func renderHelp(mode viewMode) string {
 		rendered = append(rendered, lipgloss.JoinHorizontal(lipgloss.Top, keyStyle.Render(p.key), " "+baseStyle.Render(p.msg)))
 	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+	return strings.Join(rendered, "  ")
 }
 
 func shortID(id string) string {
@@ -792,6 +1015,166 @@ func imageName(img image.Summary) string {
 		return img.RepoTags[0]
 	}
 	return img.RepoTags[0] + " +" + strconv.Itoa(len(img.RepoTags)-1)
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func isDanglingImage(img image.Summary, childCount map[string]int) bool {
+	if len(img.RepoTags) == 0 {
+		return childCount[normalizeImageID(img.ID)] == 0
+	}
+	for _, tag := range img.RepoTags {
+		if tag != "<none>:<none>" {
+			return false
+		}
+	}
+	return childCount[normalizeImageID(img.ID)] == 0
+}
+
+func virtualSizeText(img image.Summary) string {
+	if img.VirtualSize <= 0 {
+		return "-"
+	}
+	return units.HumanSize(float64(img.VirtualSize))
+}
+
+func containerPorts(c container.Summary) string {
+	if len(c.Ports) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(c.Ports))
+	for _, p := range c.Ports {
+		if p.PublicPort > 0 {
+			parts = append(parts, strconv.Itoa(int(p.PublicPort))+"->"+strconv.Itoa(int(p.PrivatePort))+"/"+p.Type)
+			continue
+		}
+		parts = append(parts, strconv.Itoa(int(p.PrivatePort))+"/"+p.Type)
+	}
+	return strings.Join(parts, ",")
+}
+
+func containerExitCode(c container.Summary) string {
+	if strings.EqualFold(c.State, "running") {
+		return "-"
+	}
+	start := strings.Index(c.Status, "Exited (")
+	if start < 0 {
+		return "-"
+	}
+	start += len("Exited (")
+	end := strings.Index(c.Status[start:], ")")
+	if end < 0 {
+		return "-"
+	}
+	return c.Status[start : start+end]
+}
+
+func buildImageUsageMap(containers []container.Summary) map[string]int {
+	usage := make(map[string]int)
+	for _, c := range containers {
+		if c.ImageID != "" {
+			usage[c.ImageID]++
+		}
+		if c.Image != "" {
+			usage[c.Image]++
+		}
+	}
+	return usage
+}
+
+func buildImageChildCountMap(images []image.Summary) map[string]int {
+	children := make(map[string]int)
+	for _, img := range images {
+		parent := normalizeImageID(img.ParentID)
+		if parent == "" {
+			continue
+		}
+		children[parent]++
+	}
+	return children
+}
+
+func normalizeImageID(id string) string {
+	id = strings.TrimSpace(id)
+	id = strings.TrimPrefix(id, "sha256:")
+	return id
+}
+
+func imageUseCount(img image.Summary, usage map[string]int) int {
+	if n, ok := usage[img.ID]; ok {
+		return n
+	}
+	for _, tag := range img.RepoTags {
+		if n, ok := usage[tag]; ok {
+			return n
+		}
+	}
+	return 0
+}
+
+func (m *model) rebuildImages() {
+	filtered := make([]image.Summary, 0, len(m.imagesAll))
+	for _, img := range m.imagesAll {
+		if m.danglingOnly && !isDanglingImage(img, m.imageChildren) {
+			continue
+		}
+		filtered = append(filtered, img)
+	}
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		switch m.imageSort {
+		case imageSortAge:
+			if filtered[i].Created == filtered[j].Created {
+				return filtered[i].Size > filtered[j].Size
+			}
+			return filtered[i].Created > filtered[j].Created
+		case imageSortName:
+			ni := imageName(filtered[i])
+			nj := imageName(filtered[j])
+			if ni == nj {
+				return filtered[i].Created > filtered[j].Created
+			}
+			return ni < nj
+		default:
+			if filtered[i].Size == filtered[j].Size {
+				return filtered[i].Created > filtered[j].Created
+			}
+			return filtered[i].Size > filtered[j].Size
+		}
+	})
+
+	m.images = filtered
+}
+
+func imageRunRef(img image.Summary) string {
+	for _, tag := range img.RepoTags {
+		if tag != "<none>:<none>" {
+			return tag
+		}
+	}
+	return img.ID
+}
+
+func parseVolumeCreatedAt(v string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return time.Now()
+	}
+	return t
+}
+
+func shortPath(s string, maxLen int) string {
+	if maxLen <= 3 || len(s) <= maxLen {
+		return s
+	}
+	head := (maxLen - 1) / 2
+	tail := maxLen - head - 1
+	return s[:head] + "~" + s[len(s)-tail:]
 }
 
 func shortAge(t time.Time) string {
@@ -898,6 +1281,10 @@ func main() {
 		case "exec":
 			if err := runExecBash(state.shellID); err != nil {
 				fmt.Fprintln(os.Stderr, "exec failed:", err)
+			}
+		case "run-image-bash":
+			if err := runImageBash(state.shellID); err != nil {
+				fmt.Fprintln(os.Stderr, "run failed:", err)
 			}
 		case "logs":
 			if err := runLogs(state.shellID); err != nil {
