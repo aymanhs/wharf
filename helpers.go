@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -91,7 +92,7 @@ func shortImageRef(ref string) string {
 	return ref
 }
 
-func renderHelp(mode viewMode) string {
+func renderHelp(mode viewMode, cleanupDetail bool) string {
 	baseStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	keyStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("230")).
@@ -128,9 +129,15 @@ func renderHelp(mode viewMode) string {
 			{"q", "quit"},
 		}
 	case viewCleanup:
-		parts = []helpPart{
-			{"j/k", "move"}, {"i/tab", "next"}, {"I/S-tab", "prev"}, {"g", "refresh"},
-			{"p/enter", "prune row"}, {"P", "prune all"}, {"q", "quit"},
+		if cleanupDetail {
+			parts = []helpPart{
+				{"j/k", "move"}, {"esc/enter", "back"}, {"p", "prune"}, {"q", "quit"},
+			}
+		} else {
+			parts = []helpPart{
+				{"j/k", "move"}, {"i/tab", "next"}, {"I/S-tab", "prev"}, {"g", "refresh"},
+				{"enter", "view items"}, {"p", "prune row"}, {"P", "prune all"}, {"q", "quit"},
+			}
 		}
 	}
 
@@ -193,12 +200,10 @@ func containerPorts(c container.Summary) string {
 	parts := make([]string, 0, len(c.Ports))
 	seen := make(map[string]struct{}, len(c.Ports))
 	for _, p := range c.Ports {
-		var entry string
-		if p.PublicPort > 0 {
-			entry = strconv.Itoa(int(p.PublicPort)) + ":" + strconv.Itoa(int(p.PrivatePort))
-		} else {
-			entry = strconv.Itoa(int(p.PrivatePort))
+		if p.PublicPort == 0 {
+			continue
 		}
+		entry := strconv.Itoa(int(p.PublicPort))
 		if _, ok := seen[entry]; ok {
 			continue
 		}
@@ -553,6 +558,73 @@ func buildCleanupRows(usage types.DiskUsage) []cleanupRow {
 	}
 
 	return []cleanupRow{images, containers, volumes, buildCache}
+}
+
+// buildCleanupDetailRows lists the individual items behind one Cleanup pane
+// row's reclaimable count/size — what pruning that category would actually
+// remove. Columns are deliberately generic (ID/Name, Info, Size, Age) since
+// each category's underlying object looks different.
+func buildCleanupDetailRows(usage types.DiskUsage, category confirmAction) []table.Row {
+	rows := make([]table.Row, 0)
+	switch category {
+	case confirmPruneImages:
+		for _, img := range usage.Images {
+			if img.Containers != 0 {
+				continue
+			}
+			rows = append(rows, table.Row{
+				shortID(img.ID),
+				imageName(*img),
+				units.HumanSize(float64(img.Size)),
+				shortAge(time.Unix(img.Created, 0)),
+			})
+		}
+	case confirmPruneContainers:
+		for _, c := range usage.Containers {
+			if strings.EqualFold(c.State, "running") {
+				continue
+			}
+			rows = append(rows, table.Row{
+				shortID(c.ID),
+				containerName(*c) + " (" + c.State + ")",
+				units.HumanSize(float64(c.SizeRw)),
+				shortAge(time.Unix(c.Created, 0)),
+			})
+		}
+	case confirmPruneVolumes:
+		for _, v := range usage.Volumes {
+			if v.UsageData == nil || v.UsageData.RefCount != 0 {
+				continue
+			}
+			size := v.UsageData.Size
+			if size < 0 {
+				size = 0
+			}
+			rows = append(rows, table.Row{
+				v.Name,
+				v.Driver,
+				units.HumanSize(float64(size)),
+				shortAge(parseCreatedAt(v.CreatedAt)),
+			})
+		}
+	case confirmPruneBuildCache:
+		for _, rec := range usage.BuildCache {
+			if rec.InUse {
+				continue
+			}
+			desc := rec.Description
+			if len(desc) > 40 {
+				desc = desc[:40]
+			}
+			rows = append(rows, table.Row{
+				shortID(rec.ID),
+				desc,
+				units.HumanSize(float64(rec.Size)),
+				shortAge(rec.CreatedAt),
+			})
+		}
+	}
+	return rows
 }
 
 func max(a, b int) int {

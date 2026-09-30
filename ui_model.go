@@ -68,15 +68,19 @@ func (m *model) syncRows() {
 			})
 		}
 	} else if m.mode == viewCleanup {
-		rows = make([]table.Row, 0, len(m.cleanupRows))
-		for _, row := range m.cleanupRows {
-			rows = append(rows, table.Row{
-				row.label,
-				strconv.Itoa(row.total),
-				units.HumanSize(float64(row.totalSize)),
-				strconv.Itoa(row.reclaim),
-				units.HumanSize(float64(row.reclaimSize)),
-			})
+		if m.cleanupDetailCategory != confirmNone {
+			rows = buildCleanupDetailRows(m.diskUsage, m.cleanupDetailCategory)
+		} else {
+			rows = make([]table.Row, 0, len(m.cleanupRows))
+			for _, row := range m.cleanupRows {
+				rows = append(rows, table.Row{
+					row.label,
+					strconv.Itoa(row.total),
+					units.HumanSize(float64(row.totalSize)),
+					strconv.Itoa(row.reclaim),
+					units.HumanSize(float64(row.reclaimSize)),
+				})
+			}
 		}
 	} else {
 		rows = make([]table.Row, 0, len(m.containers))
@@ -203,6 +207,17 @@ func (m *model) resizeTable() {
 		})
 		return
 	}
+	if m.mode == viewCleanup && m.cleanupDetailCategory != confirmNone {
+		const idWidth, sizeWidth, ageWidth = 16, 12, 6
+		infoWidth := max(16, m.width-idWidth-sizeWidth-ageWidth-tableHorizPadding)
+		m.setColumns([]table.Column{
+			{Title: "ID/Name", Width: idWidth},
+			{Title: "Info", Width: infoWidth},
+			{Title: "Size", Width: sizeWidth},
+			{Title: "Age", Width: ageWidth},
+		})
+		return
+	}
 	if m.mode == viewCleanup {
 		remaining := m.width - 12 - 14 - 12 - 14 - tableHorizPadding
 		labelWidth := max(12, remaining)
@@ -216,7 +231,8 @@ func (m *model) resizeTable() {
 		return
 	}
 
-	remaining := m.width - idWidth - 54 - 7 - 6 - 10 - 16 - tableHorizPadding
+	const portsWidth = 16
+	remaining := m.width - idWidth - portsWidth - 7 - 6 - 10 - 16 - tableHorizPadding
 	nameWidth := max(minName, remaining/3)
 	imageWidth := max(12, remaining-nameWidth)
 
@@ -224,7 +240,7 @@ func (m *model) resizeTable() {
 		{Title: "ID", Width: idWidth},
 		{Title: "Container", Width: nameWidth},
 		{Title: "Image", Width: imageWidth},
-		{Title: "Ports", Width: 54},
+		{Title: "Ports", Width: portsWidth},
 		{Title: "Age", Width: 7},
 		{Title: "Exit", Width: 6},
 		{Title: "State", Width: 10},
@@ -261,6 +277,27 @@ func (m *model) selectedCleanupRow() *cleanupRow {
 	return &m.cleanupRows[m.clampCursor(len(m.cleanupRows))]
 }
 
+func (m *model) cleanupRowByAction(action confirmAction) *cleanupRow {
+	for i := range m.cleanupRows {
+		if m.cleanupRows[i].action == action {
+			return &m.cleanupRows[i]
+		}
+	}
+	return nil
+}
+
+// closeCleanupDetail returns from the drill-down item list back to the
+// Cleanup pane's category summary.
+func (m *model) closeCleanupDetail() {
+	m.cleanupDetailCategory = confirmNone
+	m.cursor = 0
+	m.status = ""
+	m.err = nil
+	m.clampCursor(m.rowsLenForMode())
+	m.resizeTable()
+	m.syncRows()
+}
+
 func (m model) rowsLenForMode() int {
 	switch m.mode {
 	case viewImages:
@@ -270,6 +307,9 @@ func (m model) rowsLenForMode() int {
 	case viewPorts:
 		return len(m.visiblePorts())
 	case viewCleanup:
+		if m.cleanupDetailCategory != confirmNone {
+			return len(buildCleanupDetailRows(m.diskUsage, m.cleanupDetailCategory))
+		}
 		return len(m.cleanupRows)
 	default:
 		return len(m.containers)
@@ -330,6 +370,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeTable()
 			return m, nil
 		}
+		m.diskUsage = msg.usage
 		m.cleanupRows = buildCleanupRows(msg.usage)
 		m.err = nil
 		if m.mode != viewCleanup {
@@ -618,10 +659,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			m.resizeTable()
 			return m, nil
+		case "esc":
+			if m.mode == viewCleanup && m.cleanupDetailCategory != confirmNone {
+				m.closeCleanupDetail()
+			}
+			return m, nil
 		case "p", "enter":
 			if m.mode == viewCleanup {
+				if m.cleanupDetailCategory != confirmNone {
+					if msg.String() == "enter" {
+						m.closeCleanupDetail()
+						return m, nil
+					}
+					row := m.cleanupRowByAction(m.cleanupDetailCategory)
+					if row == nil {
+						return m, nil
+					}
+					m.confirming = row.action
+					m.status = fmt.Sprintf("prune %s (%d reclaimable, %s)? y/n", strings.ToLower(row.label), row.reclaim, units.HumanSize(float64(row.reclaimSize)))
+					m.err = nil
+					m.resizeTable()
+					return m, nil
+				}
 				row := m.selectedCleanupRow()
 				if row == nil {
+					return m, nil
+				}
+				if msg.String() == "enter" {
+					m.cleanupDetailCategory = row.action
+					m.cursor = 0
+					m.status = fmt.Sprintf("%s to be pruned — esc/enter to go back", row.label)
+					m.err = nil
+					m.clampCursor(m.rowsLenForMode())
+					m.resizeTable()
+					m.syncRows()
 					return m, nil
 				}
 				m.confirming = row.action
@@ -761,6 +832,9 @@ func (m model) View() string {
 	}
 	if m.mode == viewCleanup {
 		modeLabel = "cleanup"
+		if row := m.cleanupRowByAction(m.cleanupDetailCategory); row != nil {
+			modeLabel = "cleanup:" + strings.ToLower(row.label)
+		}
 	}
 
 	header := lipgloss.NewStyle().
@@ -797,7 +871,7 @@ func (m model) View() string {
 		Foreground(lipgloss.Color("109")).
 		Render(fmt.Sprintf("containers: %d   images: %d   volumes: %d   ports: %d (active: %d)   selected: %d   mode: %s", len(m.containers), len(m.images), len(m.volumes), len(visiblePorts), countActivePorts(visiblePorts), len(m.selectedImages), modeShort))
 
-	help := renderHelp(m.mode)
+	help := renderHelp(m.mode, m.cleanupDetailCategory != confirmNone)
 
 	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
 	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)

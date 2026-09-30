@@ -267,5 +267,6 @@ func (m model) diskUsageCmd() tea.Cmd {
 // or stale table while the (potentially slow) call is in flight.
 func (m *model) startDiskUsage() tea.Cmd {
 	m.diskUsageLoading = true
+	m.cleanupDetailCategory = confirmNone
 	return tea.Batch(m.diskUsageCmd(), m.spinner.Tick)
 }

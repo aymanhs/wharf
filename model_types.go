@@ -96,30 +96,32 @@ const (
 )
 
 type model struct {
-	cli              *client.Client
-	containers       []container.Summary
-	ports            []portMapping
-	volumes          []*volume.Volume
-	images           []image.Summary
-	cursor           int
-	showAll          bool
-	mode             viewMode
-	table            table.Model
-	width            int
-	height           int
-	status           string
-	err              error
-	confirming       confirmAction
-	selectedImages   map[string]struct{}
-	imageUsage       map[string]int
-	imageChildren    map[string]int
-	imagesAll        []image.Summary
-	danglingOnly     bool
-	imageSort        imageSortMode
-	portsPublished   bool
-	cleanupRows      []cleanupRow
-	diskUsageLoading bool
-	spinner          spinner.Model
+	cli                   *client.Client
+	containers            []container.Summary
+	ports                 []portMapping
+	volumes               []*volume.Volume
+	images                []image.Summary
+	cursor                int
+	showAll               bool
+	mode                  viewMode
+	table                 table.Model
+	width                 int
+	height                int
+	status                string
+	err                   error
+	confirming            confirmAction
+	selectedImages        map[string]struct{}
+	imageUsage            map[string]int
+	imageChildren         map[string]int
+	imagesAll             []image.Summary
+	danglingOnly          bool
+	imageSort             imageSortMode
+	portsPublished        bool
+	cleanupRows           []cleanupRow
+	diskUsage             types.DiskUsage
+	cleanupDetailCategory confirmAction
+	diskUsageLoading      bool
+	spinner               spinner.Model
 
 	// Set when user requests interactive shell handoff so main can resume after quitting.
 	shellAction string
@@ -132,7 +134,7 @@ func newModel(cli *client.Client, showAll bool, cursor int) model {
 			{Title: "ID", Width: 12},
 			{Title: "Container", Width: 16},
 			{Title: "Image", Width: 16},
-			{Title: "Ports", Width: 34},
+			{Title: "Ports", Width: 16},
 			{Title: "Age", Width: 7},
 			{Title: "Exit", Width: 3},
 			{Title: "State", Width: 5},
