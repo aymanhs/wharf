@@ -91,9 +91,7 @@ func (m *model) syncRows() {
 				shortImageRef(c.Image),
 				containerPorts(c),
 				shortAge(time.Unix(c.Created, 0)),
-				containerExitCode(c),
-				c.State,
-				c.Status,
+				containerStatus(c),
 			})
 		}
 	}
@@ -232,7 +230,8 @@ func (m *model) resizeTable() {
 	}
 
 	const portsWidth = 16
-	remaining := m.width - idWidth - portsWidth - 7 - 6 - 10 - 16 - tableHorizPadding
+	const statusWidth = 14
+	remaining := m.width - idWidth - portsWidth - 7 - statusWidth - tableHorizPadding
 	nameWidth := max(minName, remaining/3)
 	imageWidth := max(12, remaining-nameWidth)
 
@@ -242,9 +241,7 @@ func (m *model) resizeTable() {
 		{Title: "Image", Width: imageWidth},
 		{Title: "Ports", Width: portsWidth},
 		{Title: "Age", Width: 7},
-		{Title: "Exit", Width: 6},
-		{Title: "State", Width: 10},
-		{Title: "Status", Width: 16},
+		{Title: "Status", Width: statusWidth},
 	})
 }
 

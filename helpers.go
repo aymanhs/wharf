@@ -216,20 +216,26 @@ func containerPorts(c container.Summary) string {
 	return strings.Join(parts, ",")
 }
 
-func containerExitCode(c container.Summary) string {
-	if strings.EqualFold(c.State, "running") {
-		return "-"
-	}
-	start := strings.Index(c.Status, "Exited (")
-	if start < 0 {
-		return "-"
-	}
-	start += len("Exited (")
-	end := strings.Index(c.Status[start:], ")")
-	if end < 0 {
-		return "-"
-	}
-	return c.Status[start : start+end]
+func containerStatus(c container.Summary) string {
+	return strings.NewReplacer(
+		"Less than a second", "<1s",
+		"About a minute", "~1m",
+		"About an hour", "~1h",
+		" seconds", "s",
+		" second", "s",
+		" minutes", "m",
+		" minute", "m",
+		" hours", "h",
+		" hour", "h",
+		" days", "d",
+		" day", "d",
+		" weeks", "w",
+		" week", "w",
+		" months", "mo",
+		" month", "mo",
+		" years", "y",
+		" year", "y",
+	).Replace(c.Status)
 }
 
 func buildPortMappings(containers []container.Summary) []portMapping {
